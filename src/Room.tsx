@@ -1,23 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { io, type Socket } from "socket.io-client";
-import { Device, types } from "mediasoup-client";
 import { Mic, MicOff, Video, VideoOff, MonitorUp, MonitorX, MessageSquare, PhoneOff, Link2, Check, Send, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
+import { AudioSender, Receiver, VideoSender, audioCtx, supported, type Packet, type Source } from "@/lib/media";
 
-type Source = "mic" | "cam" | "screen";
-type Remote = { name: string } & Partial<Record<Source, MediaStreamTrack>>;
+type Remote = { name: string } & Partial<Record<Source, boolean>>;
 type Msg = { id: string; from: string; name: string; text: string; ts: number };
 
 type Session = {
   socket: Socket;
-  req: <T = any>(ev: string, data?: unknown) => Promise<T>;
-  send: types.Transport;
-  recv: types.Transport;
-  producers: Partial<Record<Source, types.Producer>>;
-  consumers: Map<string, { peerId: string; source: Source; consumer: types.Consumer }>;
+  recv: Receiver;
+  senders: Partial<Record<Source, { stop(): void; requestKey(): void }>>;
 };
 
 function MediaView({ track, mirror }: { track: MediaStreamTrack; mirror?: boolean }) {
@@ -28,22 +24,22 @@ function MediaView({ track, mirror }: { track: MediaStreamTrack; mirror?: boolea
   return <video ref={ref} autoPlay playsInline muted className={cn("h-full w-full object-contain", mirror && "-scale-x-100")} />;
 }
 
-function AudioOut({ track }: { track: MediaStreamTrack }) {
-  const ref = useRef<HTMLAudioElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.srcObject = new MediaStream([track]);
-  }, [track]);
-  return <audio ref={ref} autoPlay />;
+function RemoteCanvas({ recv, id }: { recv: Receiver; id: string }) {
+  return (
+    <canvas
+      ref={(el) => {
+        if (el) recv.canvases.set(id, el);
+        else recv.canvases.delete(id);
+      }}
+      className="h-full w-full object-contain"
+    />
+  );
 }
 
-function Tile({ name, video, mic, mirror, screen }: { name: string; video?: MediaStreamTrack; mic?: boolean; mirror?: boolean; screen?: boolean }) {
+function Tile({ name, media, mic, screen }: { name: string; media?: ReactNode; mic?: boolean; screen?: boolean }) {
   return (
     <div className="relative flex h-full w-full min-h-0 min-w-0 items-center justify-center overflow-hidden rounded-xl border bg-card">
-      {video ? (
-        <MediaView track={video} mirror={mirror} />
-      ) : (
-        <div className="flex size-20 items-center justify-center rounded-full bg-secondary text-2xl font-semibold uppercase">{name.slice(0, 1)}</div>
-      )}
+      {media ?? <div className="flex size-20 items-center justify-center rounded-full bg-secondary text-2xl font-semibold uppercase">{name.slice(0, 1)}</div>}
       <div className="absolute bottom-2 left-2 flex items-center gap-1.5 rounded-md bg-black/60 px-2 py-1 text-xs">
         {!screen && (mic ? <Mic className="size-3" /> : <MicOff className="size-3 text-destructive" />)}
         {screen && <MonitorUp className="size-3" />}
@@ -57,7 +53,7 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
   const [name, setName] = useState(() => localStorage.getItem("callio:name") ?? "");
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(() => (supported() ? "" : "This browser does not support WebCodecs. Use a recent Chrome, Edge, Firefox or Safari."));
   const [wantMic, setWantMic] = useState(true);
   const [wantCam, setWantCam] = useState(true);
 
@@ -71,6 +67,7 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
   const [selfId, setSelfId] = useState("");
 
   const session = useRef<Session | null>(null);
+  const tracks = useRef<Partial<Record<Source, MediaStreamTrack>>>({});
   const chatOpenRef = useRef(chatOpen);
   chatOpenRef.current = chatOpen;
   const chatEnd = useRef<HTMLDivElement>(null);
@@ -82,78 +79,52 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
     const s = session.current;
     session.current = null;
     if (!s) return;
-    Object.values(s.producers).forEach((p) => p?.track?.stop());
-    s.send.close();
+    Object.values(s.senders).forEach((x) => x?.stop());
+    Object.values(tracks.current).forEach((t) => t?.stop());
+    tracks.current = {};
     s.recv.close();
     s.socket.disconnect();
   }
 
-  const patchRemote = (peerId: string, patch: Partial<Remote>) =>
-    setRemotes((r) => (r[peerId] || patch.name ? { ...r, [peerId]: { ...r[peerId], ...patch } as Remote } : r));
-
   async function join() {
+    audioCtx(); // unlock audio inside the click
     setJoining(true);
     setError("");
     localStorage.setItem("callio:name", name);
     try {
       const socket = io({ transports: ["websocket"] });
-      const req = <T,>(ev: string, data?: unknown) =>
-        new Promise<T>((res, rej) => socket.emit(ev, data, (r: any) => (r?.error ? rej(new Error(r.error)) : res(r))));
-
-      let ready!: () => void;
-      const readyP = new Promise<void>((r) => (ready = r));
-
-      const consume = async (producerId: string, peerId: string, source: Source) => {
-        await readyP;
-        const s = session.current!;
-        const params = await req<any>("consume", { transportId: s.recv.id, producerId, rtpCapabilities: device.rtpCapabilities });
-        const consumer = await s.recv.consume(params);
-        s.consumers.set(producerId, { peerId, source, consumer });
-        await req("resume", { consumerId: consumer.id });
-        patchRemote(peerId, { [source]: consumer.track });
-      };
+      const recv = new Receiver(() => socket.emit("needKey"));
+      session.current = { socket, recv, senders: {} };
 
       socket.on("peerJoined", ({ id, name }) => setRemotes((r) => ({ ...r, [id]: { name } })));
-      socket.on("peerLeft", ({ id }) =>
+      socket.on("peerLeft", ({ id }) => {
+        recv.drop(id);
         setRemotes((r) => {
           const { [id]: _, ...rest } = r;
           return rest;
-        })
-      );
-      socket.on("newProducer", ({ producerId, peerId, source }) => consume(producerId, peerId, source).catch(console.error));
-      socket.on("producerClosed", ({ producerId }) => {
-        const c = session.current?.consumers.get(producerId);
-        if (!c) return;
-        c.consumer.close();
-        session.current!.consumers.delete(producerId);
-        patchRemote(c.peerId, { [c.source]: undefined });
+        });
       });
+      socket.on("source", ({ peerId, source, on }: { peerId: string; source: Source; on: boolean }) => {
+        if (!on) recv.drop(peerId, source);
+        setRemotes((r) => (r[peerId] ? { ...r, [peerId]: { ...r[peerId], [source]: on } } : r));
+      });
+      socket.on("media", (peerId: string, p: Packet) => recv.handle(peerId, p));
+      socket.on("needKey", () => Object.values(session.current?.senders ?? {}).forEach((x) => x?.requestKey()));
       socket.on("chat", (m: Msg) => {
         setMessages((ms) => [...ms, m]);
         if (!chatOpenRef.current) setUnread((u) => u + 1);
       });
       socket.on("disconnect", () => setError("Disconnected from server"));
 
-      const joinRes = await req<any>("join", { roomId, name: name.trim() || "Guest" });
-      setSelfId(joinRes.selfId);
-      setRemotes(Object.fromEntries(joinRes.peers.map((p: any) => [p.id, { name: p.name }])));
-
-      const device = new Device();
-      await device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
-
-      const send = device.createSendTransport(await req<any>("createTransport"));
-      send.on("connect", ({ dtlsParameters }, cb, eb) => req("connectTransport", { transportId: send.id, dtlsParameters }).then(cb, eb));
-      send.on("produce", ({ kind, rtpParameters, appData }, cb, eb) =>
-        req<{ id: string }>("produce", { transportId: send.id, kind, rtpParameters, source: appData.source }).then(cb, eb)
+      const joinRes = await new Promise<any>((res, rej) =>
+        socket.emit("join", { roomId, name: name.trim() || "Guest" }, (r: any) => (r?.error ? rej(new Error(r.error)) : res(r)))
       );
-      const recv = device.createRecvTransport(await req<any>("createTransport"));
-      recv.on("connect", ({ dtlsParameters }, cb, eb) => req("connectTransport", { transportId: recv.id, dtlsParameters }).then(cb, eb));
-
-      session.current = { socket, req, send, recv, producers: {}, consumers: new Map() };
-      ready();
+      setSelfId(joinRes.selfId);
+      setRemotes(
+        Object.fromEntries(joinRes.peers.map((p: any) => [p.id, { name: p.name, ...Object.fromEntries(p.sources.map((s: string) => [s, true])) }]))
+      );
       setJoined(true);
 
-      for (const p of joinRes.producers) consume(p.producerId, p.peerId, p.source).catch(console.error);
       if (wantMic) await start("mic").catch(() => setError("Microphone unavailable"));
       if (wantCam) await start("cam").catch(() => setError("Camera unavailable"));
     } catch (e: any) {
@@ -166,34 +137,35 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
 
   async function start(source: Source) {
     const s = session.current;
-    if (!s || s.producers[source]) return;
+    if (!s || s.senders[source]) return;
     let track: MediaStreamTrack;
     if (source === "screen") {
-      track = (await navigator.mediaDevices.getDisplayMedia({ video: true })).getVideoTracks()[0];
+      track = (await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 } })).getVideoTracks()[0];
       track.onended = () => stop("screen");
     } else if (source === "mic") {
-      track = (await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })).getAudioTracks()[0];
+      track = (await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })).getAudioTracks()[0];
     } else {
       track = (await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } })).getVideoTracks()[0];
     }
-    const producer = await s.send.produce({
-      track,
-      appData: { source },
-      ...(source === "screen" ? {} : source === "cam" ? { encodings: [{ maxBitrate: 1_200_000 }] } : {}),
-    });
-    s.producers[source] = producer;
+    const send = (p: Packet) => s.socket.connected && s.socket.emit("media", p);
+    s.senders[source] =
+      source === "mic"
+        ? await AudioSender.create(track, send)
+        : new VideoSender(track, source, send, source === "cam" ? { fps: 24, bitrate: 900_000, maxW: 1280, maxH: 720 } : { fps: 12, bitrate: 1_800_000, maxW: 1920, maxH: 1080 });
+    tracks.current[source] = track;
     setLocal((l) => ({ ...l, [source]: track }));
+    s.socket.emit("source", { source, on: true });
   }
 
   async function stop(source: Source) {
     const s = session.current;
-    const p = s?.producers[source];
-    if (!s || !p) return;
-    delete s.producers[source];
-    p.track?.stop();
-    p.close();
+    if (!s?.senders[source]) return;
+    s.senders[source]!.stop();
+    delete s.senders[source];
+    tracks.current[source]?.stop();
+    delete tracks.current[source];
     setLocal((l) => ({ ...l, [source]: undefined }));
-    await s.req("closeProducer", { producerId: p.id }).catch(() => {});
+    s.socket.emit("source", { source, on: false });
   }
 
   const toggle = (source: Source) => (local[source] ? stop(source) : start(source).catch((e) => e?.name !== "NotAllowedError" && setError(String(e?.message ?? e))));
@@ -253,10 +225,10 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
 
   const myName = name.trim() || "Guest";
   const screens: React.ReactNode[] = [];
-  if (local.screen) screens.push(<Tile key="me-screen" name="Your screen" video={local.screen} screen />);
-  for (const [id, r] of Object.entries(remotes)) if (r.screen) screens.push(<Tile key={id + "-screen"} name={`${r.name}'s screen`} video={r.screen} screen />);
-  const people: React.ReactNode[] = [<Tile key="me" name={`${myName} (you)`} video={local.cam} mic={!!local.mic} mirror />];
-  for (const [id, r] of Object.entries(remotes)) people.push(<Tile key={id} name={r.name} video={r.cam} mic={!!r.mic} />);
+  if (local.screen) screens.push(<Tile key="me-screen" name="Your screen" media={<MediaView track={local.screen} />} screen />);
+  for (const [id, r] of Object.entries(remotes)) if (r.screen) screens.push(<Tile key={id + "-screen"} name={`${r.name}'s screen`} media={<RemoteCanvas recv={session.current!.recv} id={`${id}:screen`} />} screen />);
+  const people: React.ReactNode[] = [<Tile key="me" name={`${myName} (you)`} media={local.cam && <MediaView track={local.cam} mirror />} mic={!!local.mic} />];
+  for (const [id, r] of Object.entries(remotes)) people.push(<Tile key={id} name={r.name} media={r.cam && <RemoteCanvas recv={session.current!.recv} id={`${id}:cam`} />} mic={!!r.mic} />);
 
   const grid = (items: React.ReactNode[]) => {
     const cols = Math.ceil(Math.sqrt(items.length));
@@ -273,7 +245,6 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
 
   return (
     <div className="flex h-full flex-col">
-      {Object.entries(remotes).map(([id, r]) => r.mic && <AudioOut key={id} track={r.mic} />)}
       <header className="flex items-center justify-between border-b px-4 py-2">
         <div className="text-sm">
           <span className="font-semibold">Callio</span>
