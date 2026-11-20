@@ -38,7 +38,7 @@ function AudioOut({ track }: { track: MediaStreamTrack }) {
 
 function Tile({ name, video, mic, mirror, screen }: { name: string; video?: MediaStreamTrack; mic?: boolean; mirror?: boolean; screen?: boolean }) {
   return (
-    <div className="relative flex aspect-video min-h-0 items-center justify-center overflow-hidden rounded-xl border bg-card">
+    <div className="relative flex h-full w-full min-h-0 min-w-0 items-center justify-center overflow-hidden rounded-xl border bg-card">
       {video ? (
         <MediaView track={video} mirror={mirror} />
       ) : (
@@ -252,13 +252,24 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
   }
 
   const myName = name.trim() || "Guest";
-  const tiles: React.ReactNode[] = [];
-  if (local.screen) tiles.push(<Tile key="me-screen" name="Your screen" video={local.screen} screen />);
-  for (const [id, r] of Object.entries(remotes)) if (r.screen) tiles.push(<Tile key={id + "-screen"} name={`${r.name}'s screen`} video={r.screen} screen />);
-  tiles.push(<Tile key="me" name={`${myName} (you)`} video={local.cam} mic={!!local.mic} mirror />);
-  for (const [id, r] of Object.entries(remotes)) tiles.push(<Tile key={id} name={r.name} video={r.cam} mic={!!r.mic} />);
+  const screens: React.ReactNode[] = [];
+  if (local.screen) screens.push(<Tile key="me-screen" name="Your screen" video={local.screen} screen />);
+  for (const [id, r] of Object.entries(remotes)) if (r.screen) screens.push(<Tile key={id + "-screen"} name={`${r.name}'s screen`} video={r.screen} screen />);
+  const people: React.ReactNode[] = [<Tile key="me" name={`${myName} (you)`} video={local.cam} mic={!!local.mic} mirror />];
+  for (const [id, r] of Object.entries(remotes)) people.push(<Tile key={id} name={r.name} video={r.cam} mic={!!r.mic} />);
 
-  const cols = tiles.length <= 1 ? "grid-cols-1" : tiles.length <= 4 ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-2 lg:grid-cols-3";
+  const grid = (items: React.ReactNode[]) => {
+    const cols = Math.ceil(Math.sqrt(items.length));
+    const rows = Math.ceil(items.length / cols);
+    return (
+      <div
+        className="grid h-full min-h-0 w-full gap-3"
+        style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))` }}
+      >
+        {items}
+      </div>
+    );
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -275,7 +286,20 @@ export default function Room({ roomId, onLeave }: { roomId: string; onLeave: () 
 
       <div className="flex min-h-0 flex-1">
         <div className="flex min-h-0 flex-1 flex-col">
-          <div className={cn("grid min-h-0 flex-1 content-center gap-3 overflow-auto p-4", cols)}>{tiles}</div>
+          <div className="flex min-h-0 flex-1 flex-col gap-3 p-4 md:flex-row">
+            {screens.length > 0 ? (
+              <>
+                <div className="min-h-0 min-w-0 flex-[3]">{grid(screens)}</div>
+                <div className="flex min-h-0 min-w-0 flex-1 gap-3 overflow-auto md:max-w-72 md:flex-col">
+                  {people.map((t, i) => (
+                    <div key={i} className="aspect-video w-48 shrink-0 md:w-full">{t}</div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              grid(people)
+            )}
+          </div>
           {error && <p className="pb-2 text-center text-sm text-destructive">{error}</p>}
           <div className="flex justify-center gap-3 pb-5">
             <Button size="icon" variant={local.mic ? "secondary" : "destructive"} onClick={() => toggle("mic")} title="Microphone">
