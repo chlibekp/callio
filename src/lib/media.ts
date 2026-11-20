@@ -1,6 +1,6 @@
 // Media over WebSocket: WebCodecs encode -> server relay -> WebCodecs decode.
 export type Source = "mic" | "cam" | "screen";
-export type Packet = { s: Source; k: 0 | 1; t: number; d: ArrayBuffer | Uint8Array };
+export type Packet = { s: Source; k: 0 | 1; t: number; q?: number; d: ArrayBuffer | Uint8Array };
 type Send = (p: Packet) => void;
 
 const SAMPLE_RATE = 48000;
@@ -34,6 +34,7 @@ export class VideoSender {
   private forceKey = true;
   private lastKey = 0;
   private t0 = performance.now();
+  private seq = 0;
 
   constructor(
     track: MediaStreamTrack,
@@ -68,7 +69,7 @@ export class VideoSender {
         output: (chunk) => {
           const d = new Uint8Array(chunk.byteLength);
           chunk.copyTo(d);
-          this.send({ s: this.source, k: chunk.type === "key" ? 1 : 0, t: chunk.timestamp, d });
+          this.send({ s: this.source, k: chunk.type === "key" ? 1 : 0, t: chunk.timestamp, q: this.seq++, d });
         },
         error: (e) => {
           console.error("encoder", e);
@@ -83,7 +84,7 @@ export class VideoSender {
     this.ctx2d.drawImage(v, 0, 0, w, h);
     const frame = new VideoFrame(this.canvas, { timestamp: Math.round((performance.now() - this.t0) * 1000) });
     const now = performance.now();
-    const keyFrame = this.forceKey || now - this.lastKey > 4000;
+    const keyFrame = this.forceKey || now - this.lastKey > 3000;
     if (keyFrame) {
       this.forceKey = false;
       this.lastKey = now;
@@ -174,7 +175,7 @@ export class AudioSender {
 /** Decodes incoming packets: video onto registered canvases, audio to speakers. */
 export class Receiver {
   canvases = new Map<string, HTMLCanvasElement>();
-  private video = new Map<string, { dec: VideoDecoder; gotKey: boolean }>();
+  private video = new Map<string, { dec: VideoDecoder; gotKey: boolean; seq: number }>();
   private audio = new Map<string, { dec: AudioDecoder; next: number }>();
   private lastKeyReq = 0;
 
@@ -182,7 +183,7 @@ export class Receiver {
 
   private askKey() {
     const now = performance.now();
-    if (now - this.lastKeyReq < 1000) return;
+    if (now - this.lastKeyReq < 500) return;
     this.lastKeyReq = now;
     this.needKey();
   }
@@ -211,9 +212,14 @@ export class Receiver {
         },
       });
       dec.configure({ codec: "vp8", optimizeForLatency: true });
-      st = { dec, gotKey: false };
+      st = { dec, gotKey: false, seq: -1 };
       this.video.set(key, st);
     }
+    // A lost delta frame corrupts every following frame until the next keyframe:
+    // on any gap, freeze on the last good frame and wait for a fresh keyframe.
+    const gap = p.q !== undefined && st.seq >= 0 && p.q !== st.seq + 1;
+    if (p.q !== undefined) st.seq = p.q;
+    if (gap && !p.k) st.gotKey = false;
     if (!st.gotKey) {
       if (!p.k) return this.askKey();
       st.gotKey = true;
